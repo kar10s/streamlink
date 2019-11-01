@@ -11,7 +11,7 @@ from socket import error as SocketError
 from threading import Thread, Event
 from time import sleep
 
-from streamlink.compat import range, urljoin, urlunparse
+from streamlink.compat import range, urljoin, urlunparse, urlparse, unquote_plus
 from streamlink.exceptions import PluginError, StreamError
 from streamlink.plugin import Plugin, PluginArguments, PluginArgument
 from streamlink.plugin.api import useragents, validate
@@ -57,6 +57,7 @@ class UHSClient(object):
         self._app_version = options.pop("app_version", self.APP_VERSION)
         self._cluster = options.pop("cluster", "live")
         self._password = options.pop("password")
+        self._proxy_url = options.pop("proxy")
         self._ws = None
 
     @property
@@ -79,11 +80,32 @@ class UHSClient(object):
         self._cluster = cluster
         self.reconnect()
 
+    @staticmethod
+    def parse_proxy_url(purl):
+        proxy_options = {}
+        if purl:
+            p = urlparse(purl)
+            proxy_options['proxy_type'] = p.scheme
+            proxy_options['http_proxy_host'] = p.hostname
+            if p.port:
+                proxy_options['http_proxy_port'] = p.port
+            if p.username:
+                proxy_options['http_proxy_auth'] = (unquote_plus(p.username), unquote_plus(p.password or ""))
+        return proxy_options
+
     def connect(self):
-        log.debug("Connecting to {0}".format(self.host))
+        proxy_options = self.parse_proxy_url(self._proxy_url)
+        if proxy_options.get('http_proxy_host'):
+            log.debug("Connecting to {0} via proxy ({1}://{2}:{3})".format(self.host,
+                                                                           proxy_options.get('proxy_type') or "http",
+                                                                           proxy_options.get('http_proxy_host'),
+                                                                           proxy_options.get('http_proxy_port') or 80))
+        else:
+            log.debug("Connecting to {0}".format(self.host))
         self._ws = websocket.create_connection(self.host,
                                                header=["User-Agent: {0}".format(useragents.CHROME)],
-                                               origin="http://www.ustream.tv")
+                                               origin="https://www.ustream.tv",
+                                               **proxy_options)
 
         args = dict(type="viewer",
                     appId=self._app_id,
@@ -269,9 +291,11 @@ class UHSStream(Stream):
             while not self.stopped.wait(0):
                 try:
                     cmd_args = self.api.recv()
-                except SocketError as err:
+                except (SocketError,
+                        websocket._exceptions.WebSocketConnectionClosedException) as err:
                     cmd_args = None
-                    if err.errno in (errno.ECONNRESET, errno.ETIMEDOUT):
+                    if (hasattr(err, "errno") and err.errno in (errno.ECONNRESET, errno.ETIMEDOUT)
+                            or "Connection is already closed." in str(err)):
                         while True:
                             # --stream-timeout will handle the timeout
                             try:
@@ -285,6 +309,8 @@ class UHSStream(Stream):
                                 sleep(reconnect_time_ws)
                     else:
                         raise
+                except PluginError:
+                    continue
 
                 if not cmd_args:
                     continue
@@ -300,6 +326,7 @@ class UHSStream(Stream):
             def _stopper(*args, **kwargs):
                 self.stop()
                 return f(*args, **kwargs)
+
             return _stopper
 
         def handle_module_info(self, args):
@@ -390,7 +417,7 @@ class UStreamTV(Plugin):
                     res["streams"] = []
                     for stream in flv_segmented["streams"]:
                         res["streams"] += [dict(
-                            stream_name=stream["preset"],
+                            stream_name="{0}p".format(stream["videoCodec"]["height"]),
                             path=urljoin(path,
                                          stream["segmentUrl"].replace("%", "%s")),
                             hashes=flv_segmented["hashes"],
@@ -407,8 +434,8 @@ class UStreamTV(Plugin):
                     raise PluginError("Stream format is not supported: {0}".format(
                         ", ".join(data["streamFormats"].keys())))
             elif "stream" in arg and arg["stream"]["contentAvailable"] is False:
-                    log.error("This stream is currently offline")
-                    raise ModuleInfoNoStreams
+                log.error("This stream is currently offline")
+                raise ModuleInfoNoStreams
 
         return res
 
@@ -428,13 +455,16 @@ class UStreamTV(Plugin):
     def _get_streams(self):
         media_id, application = self._get_media_app()
         if media_id:
-            api = UHSClient(media_id, application, referrer=self.url, cluster="live", password=self.get_option("password"))
+            api = UHSClient(media_id, application,
+                            referrer=self.url,
+                            cluster="live",
+                            password=self.get_option("password"),
+                            proxy=self.session.get_option("http-proxy"))
             log.debug("Connecting to UStream API: media_id={0}, application={1}, referrer={2}, cluster={3}",
                       media_id, application, self.url, "live")
             api.connect()
 
             streams_data = {}
-            streams = {}
             for _ in range(5):
                 # do not use to many tries, it might take longer for a timeout
                 # when streamFormats is {} and contentAvailable is True
@@ -450,11 +480,12 @@ class UStreamTV(Plugin):
                         log.debug("Unexpected `{0}` command".format(data["cmd"]))
                         log.trace("{0!r}".format(data))
                 except ModuleInfoNoStreams:
-                    return None
+                    break
 
                 if streams_data.get("streams") and streams_data.get("cdn_url"):
-                    for s in streams_data["streams"]:
-                        streams[s["stream_name"]] = UHSStream(
+                    for s in sorted(streams_data["streams"],
+                                    key=lambda k: (k["stream_name"], k["path"])):
+                        yield s["stream_name"], UHSStream(
                             session=self.session,
                             api=api,
                             first_chunk_data=ChunkData(
@@ -465,7 +496,7 @@ class UStreamTV(Plugin):
                             template_url=urljoin(streams_data["cdn_url"],
                                                  s["path"]),
                         )
-                    return streams
+                    break
 
     def _get_media_app(self):
         umatch = self.url_re.match(self.url)

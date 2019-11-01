@@ -4,7 +4,7 @@ import argparse
 import logging
 import re
 
-from streamlink.compat import parse_qsl, is_py2
+from streamlink.compat import is_py2, parse_qsl, urlparse, urlunparse
 from streamlink.plugin import Plugin, PluginError, PluginArguments, PluginArgument
 from streamlink.plugin.api import validate, useragents
 from streamlink.plugin.api.utils import itertags, parse_query
@@ -76,6 +76,23 @@ _config_schema = validate.Schema(
             }]
         ),
         validate.optional("hlsvp"): validate.text,
+        validate.optional("player_response"): validate.all(
+            validate.text,
+            validate.transform(parse_json),
+            {
+                validate.optional("streamingData"): {
+                    validate.optional("hlsManifestUrl"): validate.text,
+                },
+                validate.optional("videoDetails"): {
+                    validate.optional("isLive"): validate.transform(bool),
+                },
+                validate.optional("playabilityStatus"): {
+                    validate.optional("status"): validate.text,
+                    validate.optional("reason"): validate.all(validate.text,
+                                                              validate.transform(maybe_decode)),
+                },
+            },
+        ),
         validate.optional("live_playback"): validate.transform(bool),
         validate.optional("reason"): validate.all(validate.text, validate.transform(maybe_decode)),
         validate.optional("livestream"): validate.text,
@@ -92,20 +109,25 @@ _ytdata_re = re.compile(r'window\["ytInitialData"\]\s*=\s*({.*?});', re.DOTALL)
 _url_re = re.compile(r"""(?x)https?://(?:\w+\.)?youtube\.com
     (?:
         (?:
-            /(?:watch.+v=|embed/(?!live_stream)|v/)
-            (?P<video_id>[0-9A-z_-]{11})
+            /(?:
+                watch.+v=
+                |
+                embed/(?!live_stream)
+                |
+                v/
+            )(?P<video_id>[0-9A-z_-]{11})
         )
         |
         (?:
             /(?:
-                (?:user|channel)/
+                (?:user|c(?:hannel)?)/
                 |
                 embed/live_stream\?channel=
-            )(?P<user>[^/?&]+)
+            )[^/?&]+
         )
         |
         (?:
-            /(?:c/)?(?P<liveChannel>[^/?]+)/live/?$
+            /(?:c/)?[^/?]+/live/?$
         )
     )
 """)
@@ -156,6 +178,10 @@ class YouTube(Plugin):
 
     def __init__(self, url):
         super(YouTube, self).__init__(url)
+        parsed = urlparse(self.url)
+        if parsed.netloc == 'gaming.youtube.com':
+            self.url = urlunparse(parsed._replace(netloc='www.youtube.com'))
+
         self.author = None
         self.title = None
         self.video_id = None
@@ -300,9 +326,12 @@ class YouTube(Plugin):
 
             res = self.session.http.get(self._video_info_url, params=params)
             info_parsed = parse_query(res.content if is_py2 else res.text, name="config", schema=_config_schema)
-            if info_parsed.get("status") == "fail":
+            if (info_parsed.get("player_response", {}).get("playabilityStatus", {}).get("status") != "OK"
+                    or info_parsed.get("status") == "fail"):
+                reason = (info_parsed.get("player_response", {}).get("playabilityStatus", {}).get("reason")
+                          or info_parsed.get("reason"))
                 log.debug("get_video_info - {0}: {1}".format(
-                    count, info_parsed.get("reason"))
+                    count, reason)
                 )
                 continue
             self.author = info_parsed.get("author")
@@ -326,7 +355,8 @@ class YouTube(Plugin):
             log.error("Could not get video info")
             return
 
-        if info.get("livestream") == '1' or info.get("live_playback") == '1':
+        if info.get("livestream") == '1' or info.get("live_playback") == '1' \
+                or info.get("player_response", {}).get("videoDetails", {}).get("isLive") == True:
             log.debug("This video is live.")
             is_live = True
 
@@ -349,7 +379,7 @@ class YouTube(Plugin):
         if not is_live:
             streams, protected = self._create_adaptive_streams(info, streams, protected)
 
-        hls_playlist = info.get("hlsvp")
+        hls_playlist = info.get("hlsvp") or info.get("player_response", {}).get("streamingData", {}).get("hlsManifestUrl")
         if hls_playlist:
             try:
                 hls_streams = HLSStream.parse_variant_playlist(

@@ -11,9 +11,9 @@ class IDF1(Plugin):
     DACAST_API_URL = 'https://json.dacast.com/b/{}/{}/{}'
     DACAST_TOKEN_URL = 'https://services.dacast.com/token/i/b/{}/{}/{}'
 
-    _url_re = re.compile(r'http://www\.idf1\.fr/(videos/[^/]+/[^/]+\.html|live\b)')
+    _url_re = re.compile(r'https?://www\.idf1\.fr/(videos/[^/]+/[^/]+\.html|live\b)')
     _video_id_re = re.compile(r"dacast\('(?P<broadcaster_id>\d+)_(?P<video_type>[a-z]+)_(?P<video_id>\d+)', 'replay_content', data\);")
-    _video_id_alt_re = re.compile(r'<script src="//player.dacast.com/js/player.js" id="(?P<broadcaster_id>\d+)_(?P<video_type>[cf])_(?P<video_id>\d+)"')
+    _video_id_alt_re = re.compile(r'<script src="https://player.dacast.com/js/player.js" id="(?P<broadcaster_id>\d+)_(?P<video_type>[cf])_(?P<video_id>\d+)"')
     _player_url = 'http://ssl.p.jwpcdn.com/player/v/7.12.6/jwplayer.flash.swf'
 
     _api_schema = validate.Schema(
@@ -54,7 +54,11 @@ class IDF1(Plugin):
         video_id = match.group('video_id')
 
         videos = self.session.http.get(self.DACAST_API_URL.format(broadcaster_id, video_type, video_id), schema=self._api_schema)
-        token = self.session.http.get(self.DACAST_TOKEN_URL.format(broadcaster_id, video_type, video_id), schema=self._token_schema)
+        token = self.session.http.get(
+            self.DACAST_TOKEN_URL.format(broadcaster_id, video_type, video_id),
+            schema=self._token_schema,
+            headers={'referer': self.url}
+        )
         parsed = []
 
         for video_url in videos:
